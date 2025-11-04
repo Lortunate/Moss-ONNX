@@ -1,0 +1,11 @@
+[package]
+name = "Moss-ONNX"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
+ndarray = { version = "0.16.1" }
+opencv = { version = "0.97.0", default-features = false, features = ["imgproc", "imgcodecs", "dnn"] }
+rayon = "1.10"
+num_cpus = "1.17.0"
