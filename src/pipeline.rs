@@ -25,7 +25,11 @@ pub struct SrPipeline {
 impl SrPipeline {
     pub fn new(model: Box<dyn SuperResolution>, base_scale: f64) -> Self {
         // Default: NearestPower to minimize final interpolation from achieved scale to target.
-        Self { model, base_scale, strategy: ScaleStrategy::NearestPower }
+        Self {
+            model,
+            base_scale,
+            strategy: ScaleStrategy::NearestPower,
+        }
     }
 
     pub fn set_strategy(&mut self, strategy: ScaleStrategy) {
@@ -48,7 +52,8 @@ impl SrPipeline {
                 let n_real = target_scale.ln() / self.base_scale.ln();
                 n_real.floor() as i32
             }
-        }.max(0);
+        }
+        .max(0);
 
         // Apply SR iteratively.
         let mut current = input;

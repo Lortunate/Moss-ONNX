@@ -5,19 +5,50 @@ use opencv::{core, core::Mat, dnn, imgproc, prelude::*};
 use ort::{Result as OrtResult, session::Session, value::Tensor};
 use std::path::Path;
 
+pub struct TilingConfig {
+    pub enabled: bool,
+    pub tile: i32,
+    pub pad: i32,
+    pub threshold_pixels: i64,
+    pub threshold_max_dim: i32,
+}
+
+impl Default for TilingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tile: 512,
+            pad: 16,
+            threshold_pixels: 1_000_000,
+            threshold_max_dim: 1024,
+        }
+    }
+}
+
 pub struct RealEsrgan {
     session: Session,
+    tiling: TilingConfig,
 }
 
 impl RealEsrgan {
     pub fn from_path(path: &Path) -> OrtResult<Self> {
         let session = session_from_path(path)?;
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            tiling: TilingConfig::default(),
+        })
     }
 
     pub fn from_bytes(bytes: &[u8]) -> OrtResult<Self> {
         let session = session_from_bytes(bytes)?;
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            tiling: TilingConfig::default(),
+        })
+    }
+
+    pub fn set_tiling_config(&mut self, cfg: TilingConfig) {
+        self.tiling = cfg;
     }
 
     fn scale_from_depth(depth: i32) -> f64 {
@@ -98,14 +129,49 @@ impl RealEsrgan {
 impl SuperResolution for RealEsrgan {
     fn run(&mut self, input: Mat) -> OrtResult<Mat> {
         let (h, w, channels, depth) = (input.rows(), input.cols(), input.channels(), input.depth());
-        let scale = Self::scale_from_depth(depth);
         let bgr_input = Self::ensure_bgr(&input, channels);
-        // Pad to even dimensions to satisfy ONNX reshape nodes that assume even H/W
-        let (padded, _pad_right, _pad_bottom) = Self::pad_even(&bgr_input);
+        let (padded, pad_right, pad_bottom) = Self::pad_even(&bgr_input);
         let (w_pad, h_pad) = (padded.cols(), padded.rows());
 
+        let use_tiling = self.needs_tiling(w_pad, h_pad);
+        let (out_full, scale_est) = if use_tiling {
+            self.infer_tiled(&padded, depth)?
+        } else {
+            self.infer_raw(&padded, depth)?
+        };
+
+        // Crop away padding to match original scaled size
+        let target_w = w * scale_est;
+        let target_h = h * scale_est;
+        let mut out_cropped = out_full;
+        if pad_right != 0 || pad_bottom != 0 {
+            let roi = core::Rect::new(0, 0, target_w.max(1), target_h.max(1));
+            let tmp = out_cropped.roi(roi).unwrap();
+            out_cropped = tmp.try_clone().unwrap();
+        }
+
+        if channels == 4 {
+            let out_rgba_full = Self::compose_bgra(&out_cropped, &input, depth, out_cropped.cols(), out_cropped.rows());
+            Ok(out_rgba_full)
+        } else {
+            Ok(out_cropped)
+        }
+    }
+}
+
+impl RealEsrgan {
+    fn needs_tiling(&self, w_pad: i32, h_pad: i32) -> bool {
+        if !self.tiling.enabled {
+            return false;
+        }
+        (w_pad as i64) * (h_pad as i64) > self.tiling.threshold_pixels || w_pad.max(h_pad) > self.tiling.threshold_max_dim
+    }
+
+    fn infer_raw(&mut self, padded_bgr: &Mat, depth: i32) -> OrtResult<(Mat, i32)> {
+        let (h_pad, w_pad) = (padded_bgr.rows(), padded_bgr.cols());
+        let scale = RealEsrgan::scale_from_depth(depth);
         let blob = dnn::blob_from_image(
-            &padded,
+            padded_bgr,
             scale,
             core::Size::new(w_pad, h_pad),
             core::Scalar::default(),
@@ -125,16 +191,13 @@ impl SuperResolution for RealEsrgan {
         let (h_out, w_out) = (out4.shape()[2] as i32, out4.shape()[3] as i32);
 
         let mut out_mat = Mat::new_rows_cols_with_default(h_out, w_out, core::CV_8UC3, core::Scalar::default()).unwrap();
-
         let buf = out_mat.data_bytes_mut().unwrap();
         let w_out_usize = w_out as usize;
-        // Avoid thread oversubscription: write in a single-threaded loop
         for (y, row) in buf.chunks_mut(w_out_usize * 3).enumerate() {
             for x in 0..w_out_usize {
                 let r = out4[[0, 0, y, x]].clamp(0.0, 1.0);
                 let g = out4[[0, 1, y, x]].clamp(0.0, 1.0);
                 let b = out4[[0, 2, y, x]].clamp(0.0, 1.0);
-
                 let idx = x * 3;
                 row[idx] = (b * 255.0).round() as u8;
                 row[idx + 1] = (g * 255.0).round() as u8;
@@ -142,29 +205,71 @@ impl SuperResolution for RealEsrgan {
             }
         }
 
-        // If we padded the input, crop the output back to the original scaled size.
-        // Estimate scale factor from output vs padded input size.
         let scale_est_w = (w_out as f64) / (w_pad as f64);
         let scale_est_h = (h_out as f64) / (h_pad as f64);
-        let scale_est = ((scale_est_w + scale_est_h) / 2.0).round() as i32; // assume isotropic scaling (2 or 4)
-        let target_w = w * scale_est;
-        let target_h = h * scale_est;
+        let scale_est = ((scale_est_w + scale_est_h) / 2.0).round() as i32;
+        Ok((out_mat, scale_est))
+    }
 
-        let out_cropped = if target_w < w_out || target_h < h_out {
-            let roi = core::Rect::new(0, 0, target_w.max(1), target_h.max(1));
-            let m = out_mat.roi(roi).unwrap();
-            // Convert ROI view to an owned Mat
-            m.try_clone().unwrap()
-        } else {
-            out_mat
-        };
+    fn infer_tiled(&mut self, input: &Mat, depth: i32) -> OrtResult<(Mat, i32)> {
+        let (h, w) = (input.rows(), input.cols());
+        let mut first_scale: Option<i32> = None;
+        let mut out_canvas: Option<Mat> = None;
 
-        if channels == 4 {
-            // Compose alpha and then crop if necessary to match target size
-            let out_rgba_full = Self::compose_bgra(&out_cropped, &input, depth, out_cropped.cols(), out_cropped.rows());
-            Ok(out_rgba_full)
-        } else {
-            Ok(out_cropped)
+        let tile = self.tiling.tile;
+        let tile_pad = self.tiling.pad;
+
+        let mut y = 0;
+        while y < h {
+            let y0 = y;
+            let y1 = (y0 + tile).min(h);
+            let y0p = (y0 - tile_pad).max(0);
+            let y1p = (y1 + tile_pad).min(h);
+            let th = y1 - y0;
+
+            let mut x = 0;
+            while x < w {
+                let x0 = x;
+                let x1 = (x0 + tile).min(w);
+                let x0p = (x0 - tile_pad).max(0);
+                let x1p = (x1 + tile_pad).min(w);
+                let tw = x1 - x0;
+
+                let roi_padded = core::Rect::new(x0p, y0p, (x1p - x0p).max(1), (y1p - y0p).max(1));
+                let tile_padded = input.roi(roi_padded).unwrap().try_clone().unwrap();
+
+                let (tile_even, _, _) = RealEsrgan::pad_even(&tile_padded);
+                let (tile_out, scale_est) = self.infer_raw(&tile_even, depth)?;
+
+                if first_scale.is_none() {
+                    first_scale = Some(scale_est);
+                }
+                let s = first_scale.unwrap();
+
+                if out_canvas.is_none() {
+                    let canvas = Mat::new_rows_cols_with_default(h * s, w * s, core::CV_8UC3, core::Scalar::default()).unwrap();
+                    out_canvas = Some(canvas);
+                }
+
+                let crop_x = (x0 - x0p) * s;
+                let crop_y = (y0 - y0p) * s;
+                let crop_w = (tw.max(1)) * s;
+                let crop_h = (th.max(1)) * s;
+                let crop_rect = core::Rect::new(crop_x.max(0), crop_y.max(0), crop_w.max(1), crop_h.max(1));
+                let tile_cropped = tile_out.roi(crop_rect).unwrap().try_clone().unwrap();
+
+                let dst_x = x0 * s;
+                let dst_y = y0 * s;
+                let dst_roi = core::Rect::new(dst_x, dst_y, tile_cropped.cols(), tile_cropped.rows());
+                let canvas_mut = out_canvas.as_mut().unwrap();
+                let mut dst_view = canvas_mut.roi_mut(dst_roi).unwrap();
+                tile_cropped.copy_to(&mut dst_view).unwrap();
+
+                x += tile;
+            }
+            y += tile;
         }
+
+        Ok((out_canvas.unwrap(), first_scale.unwrap_or(4)))
     }
 }
