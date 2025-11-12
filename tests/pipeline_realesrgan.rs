@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use moss_model::pipeline::ScaleStrategy;
-    use moss_model::{RealEsrgan, SrPipeline};
+    use moss_model::{CancellationToken, RealEsrgan, SrPipeline};
     use opencv::{core, imgcodecs, prelude::*};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -62,6 +62,7 @@ mod tests {
         let base_scale = 4.0; // RealESRGAN x4 models
         let mut pipe = SrPipeline::new(Box::new(model), base_scale);
         pipe.set_strategy(strategy);
+        let token = CancellationToken::new();
 
         let model_label = Path::new(model_path).file_stem().and_then(|s| s.to_str()).unwrap();
         let strat_label = strategy_name(strategy);
@@ -71,7 +72,7 @@ mod tests {
 
         for (path, input) in load_test_images() {
             let (w_in, h_in) = dims(&input);
-            let out = pipe.run_to_scale(input, target_scale).unwrap();
+            let out = pipe.run_to_scale(input, target_scale, &token).unwrap();
             let (w_o, h_o) = dims(&out);
             let (w_e, h_e) = expected_dims(w_in, h_in, target_scale);
             assert_eq!((w_o, h_o), (w_e, h_e));

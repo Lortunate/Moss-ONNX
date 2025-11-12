@@ -1,8 +1,8 @@
+use crate::cancel::CancellationToken;
 use opencv::core::Mat;
-use ort::Result as OrtResult;
 
 pub trait SuperResolution {
-    fn run(&mut self, input: Mat) -> OrtResult<Mat>;
+    fn run(&mut self, input: Mat, token: &CancellationToken) -> Result<Mat, String>;
 }
 
 pub mod realesrgan;

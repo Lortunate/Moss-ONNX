@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use ort::execution_providers::*;
-use ort::session::builder::SessionBuilder;
-use ort::session::Session;
 use ort::Result as OrtResult;
+use ort::execution_providers::*;
+use ort::session::Session;
+use ort::session::builder::SessionBuilder;
 
 fn create_common_session_builder() -> OrtResult<SessionBuilder> {
     let num_threads = num_cpus::get().max(1);

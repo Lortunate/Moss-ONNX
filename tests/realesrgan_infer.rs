@@ -1,12 +1,13 @@
 #[test]
 fn infer_realesrgan() {
-    use moss_model::{RealEsrgan, SuperResolution};
+    use moss_model::{CancellationToken, RealEsrgan, SuperResolution};
     use opencv::imgcodecs;
     use std::fs;
     use std::path::Path;
 
     let model_path = Path::new("models/x4plus.onnx");
     let mut sr = RealEsrgan::from_path(model_path).unwrap();
+    let token = CancellationToken::new();
 
     let _ = fs::create_dir_all("tests/results");
 
@@ -29,7 +30,7 @@ fn infer_realesrgan() {
         let input = imgcodecs::imread(path.to_str().unwrap(), imgcodecs::IMREAD_UNCHANGED).unwrap();
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
         let start = std::time::Instant::now();
-        let output = sr.run(input).unwrap();
+        let output = sr.run(input, &token).unwrap();
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         println!("{}: {:.2}ms", stem, elapsed_ms);
         let out_path = format!("tests/results/{}_x4.{}", stem, ext);
